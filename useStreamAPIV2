@@ -1,1 +1,877 @@
+import {useEffect, useRef} from 'react';
+import {useDispatch} from 'react-redux';
+import getConfig from 'next/config';
+import {useFlags} from 'launchdarkly-react-client-sdk';
 
+import {useMemberInformationState} from '../../../../common/hooks/useMemberInformationState';
+import {useAddReportingEventCallback, ReportingEventType} from '../../../../common/reporting';
+import {removePotentialCardNumbers} from '../WrapUp/WrapUpUtils';
+import {useTypedSelector} from '../../../../common/hooks';
+import {useUserState} from '../../../../common/hooks/useUserState';
+import {usePermissionsState} from '../../../../common/authPass';
+import {TelephonyStatus} from '../../../../common/components/TelephoneStatusIcon/TelephonyStatus';
+import {useLaunchDarklyState} from '../../../../common/layouts/useLaunchDarklyState';
+import {useWrapUpFormState} from '../WrapUp/useWrapUpForm';
+import {useMedicarePrescriptionPlanGlobalState} from '../../MedicarePrescriptionPlan/useMedicarePrescriptionPlanGlobalState';
+import {GENERATION_PHASE, LIFECYCLE_STATUS} from '../../../../redux/api/member/smartNoteReporting/types';
+import {setWrapUpForm} from '../../../../redux/WrapupForm/setWrapUpFrom';
+import {WrapUpFormState} from '../WrapUp/Wrapup.types';
+import {
+  setSmartNotesState,
+  setSmartNotesErrorState,
+  setSmartNotesStartTimeState,
+  setSmartNotesIsLoading,
+  setSmartNotesCallEvent
+} from '../../redux/actions/smartNotesGlobalAction';
+
+import {SmartNotesGlobalState} from './SmartNotesInterfaces';
+import {useSmartNotesGlobalState} from './useSmartNotesGlobalState';
+import {useSmartNotesMidCallState} from './useSmartNotesMidCallState';
+import {useSmartNoteReporting} from './useSmartNoteReporting';
+import {useVapDualSmartNoteState} from './useVapDualSmartNoteState';
+import {SmartNotesContextHelper} from './SmartNotesContextHelper';
+
+const {proxyServerBaseUrl, smartNoteTimeout} = getConfig().publicRuntimeConfig;
+const processedMidCallIds = new Set<string>();
+const activeStreamRequestKeys = new Set<string>();
+// UCIDs whose end-call stream has fully completed — never re-fetched regardless of trigger.
+const completedEndCallUCIDs = new Set<string>();
+const midCallAttemptedTabCallKeys = new Set<string>();
+const connectedReportCreatedCallKeys = new Set<string>();
+const initializedStartTimeMemberKeysByTab = new Map<number, string>();
+
+type ActiveCallOwnerState = {
+  callKey: string;
+  ucid: string;
+  memberId: string;
+  tabIndex: number;
+  endCallStreamTriggered?: boolean;
+};
+
+// Shared across hook instances so ownership is stable while switching member tabs.
+let activeCallOwnerState: ActiveCallOwnerState | null = null;
+
+const clearCallScopedCaches = () => {
+  processedMidCallIds.clear();
+  activeStreamRequestKeys.clear();
+  completedEndCallUCIDs.clear();
+  midCallAttemptedTabCallKeys.clear();
+  connectedReportCreatedCallKeys.clear();
+  initializedStartTimeMemberKeysByTab.clear();
+  activeCallOwnerState = null;
+};
+
+type UseSmartNotesAPIOptions = {
+  useOwnerTabContext?: boolean;
+};
+
+/** @internal Exposed for testing only */
+// eslint-disable-next-line no-underscore-dangle -- internal test utility requires underscore prefix
+export const _testUtils = {
+  resetCallScopedCaches: () => {
+    clearCallScopedCaches();
+  },
+  clearActiveCallOwnerState: () => {
+    activeStreamRequestKeys.clear();
+    activeCallOwnerState = null;
+  }
+};
+
+export function useSmartNotesApiV2(options: UseSmartNotesAPIOptions = {}) {
+  const {useOwnerTabContext = false} = options;
+  const dispatch = useDispatch();
+  const {
+    setShowSmartNotesGlobalState,
+    setSmartNotesGlobalErrorState,
+    setSmartNotesGlobalStartTimeState,
+    setGenerateGlobalSmartNotes,
+    smartNotesGlobalState: tabSmartNotesGlobalState
+  } = useSmartNotesGlobalState();
+  const {memberInformation} = useMemberInformationState();
+  const {
+    generateSmartNotesMidCallDetails,
+    midCallSmartNotes,
+    midCallSmartNotesIsError,
+    midCallSmartNotesError,
+    callEvent: reduxCallEvent,
+    isLoading: reduxIsLoading,
+    setCallEvent: setReduxCallEvent,
+    setIsLoading: setReduxIsLoading
+  } = useSmartNotesMidCallState();
+  const safeSetCallEvent =
+    typeof setReduxCallEvent === 'function' ? setReduxCallEvent : (_callEventValue: boolean) => undefined;
+  const safeSetIsLoading =
+    typeof setReduxIsLoading === 'function' ? setReduxIsLoading : (_isLoadingValue: boolean) => undefined;
+  const {telephonyStatus, isAgentAfterCallWorkInWwe, isTelephonyStatusAfterCallWorkForAmazon} = useTypedSelector(
+    (state) => state.telephonyState
+  );
+  const memberUCID = memberInformation.ucid;
+  const eventExecuted = useRef<boolean>(false);
+  const previousTelephonyStatus = useRef<TelephonyStatus | null>(null);
+  const previousCallInteractionId = useRef<string | null>(null);
+  // Persist call owner tab info at connect time, so it's still available at disconnect
+  const callOwnerTabIndexRef = useRef<number | null>(null);
+  const callOwnerMemberIdRef = useRef<string | null>(null);
+  const {setWrapUpFormState, wrapUpFormValues} = useWrapUpFormState();
+  const {isPbm, isPharmacy} = usePermissionsState();
+  const {pciFlag} = useMedicarePrescriptionPlanGlobalState();
+  const {isLDFlagEnabled} = useLaunchDarklyState();
+  const profileType = isPharmacy ? 'Pharmacy' : 'PBM';
+  const {vapAccess, vapDualAccess} = useUserState();
+  const {acUs8732807, acUs9494658, acSmartNoteDualAccess, acDe1362105b} = useFlags();
+  const callEvent = reduxCallEvent;
+  const isLoading = reduxIsLoading;
+  const setCallEvent = safeSetCallEvent;
+  const setIsLoading = safeSetIsLoading;
+  const addReportingEvent = useAddReportingEventCallback();
+  const memberId = memberInformation?.memberIdentifiers?.memberId || '';
+  const reporting = useSmartNoteReporting();
+  const midCallGenerationCount = useRef<number>(0);
+  const activeEventSourceRef = useRef<EventSource | null>(null);
+  const streamPhaseRef = useRef<'end-call' | 'mid-call' | null>(null);
+  const prevUCIDRef = useRef<string | undefined>(undefined);
+  const previousCallScopeKeyRef = useRef<string | null>(null);
+  const {setVapDualSmartNote, vapDualSmartNoteState} = useVapDualSmartNoteState();
+  const telephonyDetails = useTypedSelector((state) => state.telephonyState.telephonyDetails);
+  const tabsState = useTypedSelector((state) => state.tabsState);
+
+  const {
+    activeTabIndex,
+    firstMemberOrPatientTabIndex,
+    firstMemberOrPatientTabMemberId,
+    effectiveTabIndex,
+    previousSmartNotes,
+    ucid,
+    callUuid,
+    telephonyMemberId,
+    telephonyPatientId,
+    callOwnerKey,
+    tabMemberId,
+    tabPatientId,
+    reportingMemberId,
+    canTriggerEndCallFromCurrentTab,
+    canTriggerEndCallFromOwnerContext,
+    streamUcid: UCID
+  } = SmartNotesContextHelper.buildContext({
+    telephonyDetails,
+    tabsState,
+    memberInformation,
+    wrapUpFormValues,
+    useOwnerTabContext,
+    activeCallOwnerState,
+    callOwnerMemberIdRefCurrent: callOwnerMemberIdRef.current,
+    UCID: memberUCID,
+    memberId
+  });
+
+  const {
+    shouldRouteOwnerContextState,
+    effectiveSmartNotesGlobalState,
+    stopAutomaticNotes,
+    hasSmartNotesErrorForCurrentTab
+  } = SmartNotesContextHelper.resolveEffectiveSmartNotesGlobalState({
+    useOwnerTabContext,
+    effectiveTabIndex,
+    activeTabIndex,
+    tabsState,
+    smartNotesGlobalState: tabSmartNotesGlobalState
+  });
+
+  // Use routed owner-context state when applicable so downstream reads (including startTime)
+  // reflect the effective tab rather than only the currently active tab.
+  const smartNotesGlobalState = shouldRouteOwnerContextState
+    ? effectiveSmartNotesGlobalState
+    : tabSmartNotesGlobalState;
+  const effectiveCallEvent = Boolean(smartNotesGlobalState?.callEvent ?? callEvent);
+  const effectiveIsLoading = Boolean(smartNotesGlobalState?.isLoading ?? isLoading);
+
+  const canTriggerEndCallCheck = useOwnerTabContext
+    ? canTriggerEndCallFromOwnerContext
+    : canTriggerEndCallFromCurrentTab;
+
+  const eventCallCheck =
+    (!pciFlag || acUs9494658) &&
+    canTriggerEndCallCheck &&
+    effectiveCallEvent &&
+    ((isPbm && isLDFlagEnabled('acAutoCallRecordAiDoc')) || (isPharmacy && isLDFlagEnabled('acPharmacySmartNotes'))) &&
+    (!stopAutomaticNotes || !previousSmartNotes);
+
+  const currentCallScopeKey = `${callOwnerKey || ''}:${UCID || ''}`;
+
+  useEffect(() => {
+    const previousCallScopeKey = previousCallScopeKeyRef.current;
+    const shouldClearCaches =
+      Boolean(previousCallScopeKey) &&
+      (previousCallScopeKey !== currentCallScopeKey || telephonyStatus === TelephonyStatus.Disconnected);
+
+    if (shouldClearCaches) {
+      clearCallScopedCaches();
+    }
+
+    previousCallScopeKeyRef.current = currentCallScopeKey;
+  }, [currentCallScopeKey, telephonyStatus]);
+
+  const stableOwnerReportingMemberId =
+    activeCallOwnerState?.memberId || callOwnerMemberIdRef.current || tabMemberId || reportingMemberId;
+  const ownerIdentifier = activeCallOwnerState?.memberId || callOwnerMemberIdRef.current || '';
+
+  const isCurrentTabOwnerForCall =
+    ownerIdentifier !== '' && (tabMemberId === ownerIdentifier || tabPatientId === ownerIdentifier);
+
+  function displaySmartNotes(ucid: string | undefined, vap: boolean): boolean {
+    if (acUs8732807) {
+      return Boolean(ucid && vap);
+    } else {
+      return Boolean(ucid);
+    }
+  }
+
+  const setTargetWrapUpFormState = (props: Partial<WrapUpFormState>) => {
+    if (shouldRouteOwnerContextState) {
+      dispatch({...setWrapUpForm(props), tabIndex: effectiveTabIndex});
+      return;
+    }
+
+    // Update current active tab wrap-up state when owner-context routing is not needed.
+    setWrapUpFormState(props);
+  };
+
+  const setTargetShowSmartNotesGlobalState = (props: SmartNotesGlobalState) => {
+    if (shouldRouteOwnerContextState) {
+      dispatch({...setSmartNotesState(props), tabIndex: effectiveTabIndex});
+      return;
+    }
+
+    // Update current active tab visibility state when owner-context routing is not needed.
+    setShowSmartNotesGlobalState(props);
+  };
+
+  const setTargetSmartNotesGlobalErrorState = (props: SmartNotesGlobalState) => {
+    if (shouldRouteOwnerContextState) {
+      dispatch({...setSmartNotesErrorState(props), tabIndex: effectiveTabIndex});
+      return;
+    }
+
+    // Update current active tab error state when owner-context routing is not needed.
+    setSmartNotesGlobalErrorState(props);
+  };
+
+  const setTargetSmartNotesGlobalStartTimeState = (props: SmartNotesGlobalState) => {
+    if (shouldRouteOwnerContextState) {
+      dispatch({...setSmartNotesStartTimeState(props), tabIndex: effectiveTabIndex});
+      return;
+    }
+
+    // Update current active tab start-time state when owner-context routing is not needed.
+    setSmartNotesGlobalStartTimeState(props);
+  };
+
+  const setTargetIsLoading = (isLoadingValue: boolean) => {
+    if (shouldRouteOwnerContextState) {
+      dispatch({...setSmartNotesIsLoading({isLoading: isLoadingValue}), tabIndex: effectiveTabIndex});
+      return;
+    }
+
+    // Update current active tab loading state when owner-context routing is not needed.
+    setIsLoading(isLoadingValue);
+  };
+
+  const setTargetCallEvent = (callEventValue: boolean) => {
+    if (shouldRouteOwnerContextState) {
+      dispatch({...setSmartNotesCallEvent({callEvent: callEventValue}), tabIndex: effectiveTabIndex});
+      return;
+    }
+
+    // Update current active tab call-event state when owner-context routing is not needed.
+    setCallEvent(callEventValue);
+  };
+
+  const streamAPICall = () => {
+    if (activeEventSourceRef.current) {
+      return;
+    }
+    const streamPhase = streamPhaseRef.current || 'unknown';
+    const streamRequestKey = `${streamPhase}:${UCID || ''}`;
+    if (activeStreamRequestKeys.has(streamRequestKey)) {
+      return;
+    }
+    // Permanently block end-call stream for a UCID that has already been fully processed.
+    if (streamPhase === 'end-call' && UCID && completedEndCallUCIDs.has(UCID)) {
+      return;
+    }
+
+    activeStreamRequestKeys.add(streamRequestKey);
+
+    setTargetIsLoading(true);
+    eventExecuted.current = false;
+    const endpoint = `${proxyServerBaseUrl}/v3/sse/smartNote?ucid=${UCID}`;
+
+    let eventSource: EventSource;
+    try {
+      eventSource = new EventSource(endpoint);
+    } catch {
+      // Construction failed (e.g. invalid URL or blocked environment).
+      // Clean up the guard key and loading state so future attempts are not permanently blocked.
+      activeStreamRequestKeys.delete(streamRequestKey);
+      setTargetIsLoading(false);
+      setTargetSmartNotesGlobalErrorState({isError: true, errorID: UCID});
+      reporting.reportStreamFailure('EventSource construction failed.', LIFECYCLE_STATUS.GENERATION_ERROR);
+      return;
+    }
+    activeEventSourceRef.current = eventSource;
+
+    const closeStream = () => {
+      // Mark this UCID as permanently complete so no future end-call stream fires for it.
+      if (streamPhase === 'end-call' && UCID) {
+        completedEndCallUCIDs.add(UCID);
+      }
+      activeEventSourceRef.current = null;
+      activeStreamRequestKeys.delete(streamRequestKey);
+      eventSource.close();
+    };
+
+    eventSource.onerror = () => {
+      eventExecuted.current = true;
+      setTargetIsLoading(false);
+      closeStream();
+      setTargetSmartNotesGlobalErrorState({isError: true, errorID: UCID});
+      reporting.reportStreamFailure('SSE connection error.', LIFECYCLE_STATUS.GENERATION_ERROR);
+    };
+
+    eventSource.onmessage = (event) => {
+      const {data} = event;
+      setTargetIsLoading(false);
+      eventExecuted.current = true;
+      closeStream();
+
+      if (data && data.indexOf('FailedSummary:') !== -1) {
+        const formattedData = data.replace(/^"(.+(?="$))"$/, '$1').replace('FailedSummary:', '');
+        setTargetSmartNotesGlobalErrorState({isError: true, error: formattedData, errorID: UCID});
+        reporting.reportTranscriptNotReady();
+      } else if (data) {
+        if (vapDualAccess && acSmartNoteDualAccess) {
+          setVapDualSmartNote({...vapDualSmartNoteState, startTime: new Date().toISOString().slice(0, -1)});
+        } else {
+          setTargetSmartNotesGlobalStartTimeState({startTime: new Date().toISOString().slice(0, -1)});
+        }
+
+        let formattedData = data.replace(/^"(.+(?="$))"$/, '$1').replace(/\\n/g, '\n');
+        if (previousSmartNotes) {
+          formattedData = previousSmartNotes + formattedData;
+        }
+        setTargetSmartNotesGlobalErrorState({isError: false, error: '', errorID: ''});
+
+        if (acUs9494658) {
+          // Automatically remove credit card numbers from smart notes API data.
+          const currentMemberId = memberInformation?.memberIdentifiers?.memberId || '';
+          const targetMemberId = shouldRouteOwnerContextState ? tabMemberId || currentMemberId : currentMemberId;
+          const {cleanedText, pciDataDetected} = removePotentialCardNumbers(formattedData, targetMemberId);
+
+          // Report PCI data redaction success if data was detected and cleaned
+          if (pciDataDetected) {
+            addReportingEvent(ReportingEventType.pciDataRedactionSuccessful);
+          }
+
+          setTargetWrapUpFormState({
+            smartNotes: {data: cleanedText, error: '', isInProgress: true},
+            ...(pciDataDetected && {pciDataRedacted: true})
+          });
+
+          reporting.reportGenerationSuccess();
+        } else {
+          setTargetWrapUpFormState({
+            smartNotes: {data: formattedData, error: '', isInProgress: true}
+          });
+
+          reporting.reportGenerationSuccess();
+        }
+      } else {
+        setTargetSmartNotesGlobalErrorState({isError: true, errorID: UCID});
+        reporting.reportStreamFailure('Generation failure in stream API.', LIFECYCLE_STATUS.GENERATION_ERROR);
+      }
+    };
+
+    setTimeout(() => {
+      setTargetIsLoading(false);
+      if (!eventExecuted.current) {
+        setTargetSmartNotesGlobalErrorState({isError: true, errorID: UCID});
+        reporting.reportStreamFailure(
+          `Stream API did not receive transcript within ${smartNoteTimeout}ms.`,
+          LIFECYCLE_STATUS.STREAM_TIMEOUT
+        );
+      }
+      closeStream();
+    }, smartNoteTimeout);
+  };
+
+  useEffect(() => {
+    const isSmartNotesEligible = displaySmartNotes(UCID, Boolean(vapAccess));
+    // Initialize per CURRENT tab/member load (non-IVR can switch members while call UCID stays the same).
+    const memberIdentityKey = memberId || tabMemberId || tabPatientId || '';
+    const memberKey =
+      isSmartNotesEligible && UCID ? `${activeTabIndex}:${UCID}:${memberIdentityKey || 'unknown-member'}` : null;
+
+    if (!memberKey) {
+      initializedStartTimeMemberKeysByTab.delete(activeTabIndex);
+      return;
+    }
+
+    const previousMemberKeyForTab = initializedStartTimeMemberKeysByTab.get(activeTabIndex) || null;
+
+    if (previousMemberKeyForTab === memberKey && tabSmartNotesGlobalState?.startTime) {
+      return;
+    }
+
+    initializedStartTimeMemberKeysByTab.set(activeTabIndex, memberKey);
+    // Force write to active tab slice so non-IVR loaded tab always gets its own startTime.
+    dispatch({
+      ...setSmartNotesStartTimeState({startTime: new Date().toISOString().slice(0, -1)}),
+      tabIndex: activeTabIndex
+    });
+  }, [
+    activeTabIndex,
+    effectiveTabIndex,
+    UCID,
+    vapAccess,
+    useOwnerTabContext,
+    telephonyStatus,
+    tabMemberId,
+    tabPatientId,
+    memberId,
+    reportingMemberId,
+    tabSmartNotesGlobalState?.startTime
+  ]);
+
+  useEffect(() => {
+    if (!vapDualSmartNoteState?.startTime && acSmartNoteDualAccess && (ucid || callUuid)) {
+      setVapDualSmartNote({ucid, callUuid, startTime: new Date().toISOString().slice(0, -1)});
+    }
+  }, []);
+
+  // Reset per-call mid-call count when UCID changes so a new call starts fresh.
+  useEffect(() => {
+    if (UCID && prevUCIDRef.current !== undefined && prevUCIDRef.current !== UCID) {
+      midCallGenerationCount.current = 0;
+      previousCallInteractionId.current = null;
+    }
+    prevUCIDRef.current = UCID;
+  }, [UCID]);
+
+  const persistOwnerForActiveCall = () => {
+    const {candidateOwnerMemberId, candidateOwnerTabIndex} = SmartNotesContextHelper.resolveOwnerCandidate({
+      activeTabIndex,
+      firstMemberOrPatientTabIndex,
+      firstMemberOrPatientTabMemberId,
+      tabsState,
+      telephonyMemberId,
+      telephonyPatientId,
+      tabMemberId,
+      tabPatientId
+    });
+
+    // Lock ownership per active call; do not allow later tab mounts to overwrite owner.
+    if (candidateOwnerMemberId) {
+      if (!activeCallOwnerState || activeCallOwnerState.callKey !== callOwnerKey) {
+        activeCallOwnerState = {
+          callKey: callOwnerKey,
+          ucid: ucid || '',
+          memberId: candidateOwnerMemberId,
+          tabIndex: candidateOwnerTabIndex,
+          endCallStreamTriggered: false
+        };
+      } else {
+        // Same call key re-entered connected-with-call: keep locked owner and reset end-call trigger marker.
+        if (ucid) {
+          activeCallOwnerState.ucid = ucid;
+        }
+        activeCallOwnerState.endCallStreamTriggered = false;
+      }
+    }
+
+    if (activeCallOwnerState && activeCallOwnerState.callKey === callOwnerKey) {
+      callOwnerMemberIdRef.current = activeCallOwnerState.memberId;
+      callOwnerTabIndexRef.current = activeCallOwnerState.tabIndex;
+    } else {
+      callOwnerMemberIdRef.current = candidateOwnerMemberId || null;
+      callOwnerTabIndexRef.current = candidateOwnerTabIndex;
+    }
+
+    const resolvedOwnerMemberId =
+      (activeCallOwnerState && activeCallOwnerState.callKey === callOwnerKey
+        ? activeCallOwnerState.memberId
+        : candidateOwnerMemberId) || '';
+    const resolvedOwnerTabIndex =
+      activeCallOwnerState && activeCallOwnerState.callKey === callOwnerKey
+        ? activeCallOwnerState.tabIndex
+        : candidateOwnerTabIndex;
+    const isOwnerContextResolvedToCurrentOwner = SmartNotesContextHelper.isOwnerContextResolvedToCurrentOwner({
+      useOwnerTabContext,
+      candidateOwnerTabIndex: resolvedOwnerTabIndex,
+      effectiveTabIndex,
+      candidateOwnerMemberId: resolvedOwnerMemberId,
+      stableOwnerReportingMemberId: resolvedOwnerMemberId || stableOwnerReportingMemberId || ''
+    });
+
+    if (
+      useOwnerTabContext &&
+      isOwnerContextResolvedToCurrentOwner &&
+      canTriggerEndCallFromOwnerContext &&
+      displaySmartNotes(UCID, Boolean(vapAccess))
+    ) {
+      // Route callEvent to the owner tab so BackgroundController reads its own state, not the active tab's.
+      dispatch({...setSmartNotesCallEvent({callEvent: true}), tabIndex: effectiveTabIndex});
+      const ownerReportingMemberId = resolvedOwnerMemberId || stableOwnerReportingMemberId || reportingMemberId;
+      const ownerReportingKey = UCID && ownerReportingMemberId ? `${UCID}-${ownerReportingMemberId}` : undefined;
+      reporting.setReportingKey(ownerReportingKey);
+      if (callOwnerKey && ownerReportingKey && !connectedReportCreatedCallKeys.has(callOwnerKey)) {
+        connectedReportCreatedCallKeys.add(callOwnerKey);
+        reporting.createAttempt(
+          GENERATION_PHASE.END_CALL,
+          UCID || '',
+          LIFECYCLE_STATUS.CONNECTED,
+          undefined,
+          UCID,
+          vapDualAccess,
+          profileType
+        );
+      }
+    }
+  };
+
+  const handleOwnerEndCallFlow = (hasSmartNotesDataForCurrentTab: boolean) => {
+    if (!displaySmartNotes(UCID, Boolean(vapAccess))) {
+      setTargetShowSmartNotesGlobalState({showSmartNotes: false});
+      return;
+    }
+
+    setTargetShowSmartNotesGlobalState({showSmartNotes: true});
+    setTargetCallEvent(false);
+
+    const tabMidCallAttemptKey = `${activeTabIndex}:${UCID || ''}`;
+    const hasMidCallAttemptForCurrentTabAndCall = midCallAttemptedTabCallKeys.has(tabMidCallAttemptKey);
+
+    // If mid-call already produced notes for the owner tab, skip duplicate end-call stream.
+    // If mid-call failed (error state), hasSmartNotesDataForCurrentTab is false and stream is allowed.
+    if (hasMidCallAttemptForCurrentTabAndCall && hasSmartNotesDataForCurrentTab) {
+      return;
+    }
+
+    if (!activeCallOwnerState || activeCallOwnerState.callKey !== callOwnerKey) {
+      activeCallOwnerState = {
+        callKey: callOwnerKey,
+        ucid: ucid || '',
+        memberId: tabMemberId,
+        tabIndex: effectiveTabIndex,
+        endCallStreamTriggered: true
+      };
+    } else {
+      if (ucid) {
+        activeCallOwnerState.ucid = ucid;
+      }
+      activeCallOwnerState.endCallStreamTriggered = true;
+    }
+
+    reporting.setReportingKey(UCID && reportingMemberId ? `${UCID}-${reportingMemberId}` : undefined);
+    streamPhaseRef.current = 'end-call';
+    // Reuse the existing CONNECTED attempt for this owner reporting key.
+    // If it was not created yet, create it once and then issue REQUESTED update.
+    reporting.createAttempt(
+      GENERATION_PHASE.END_CALL,
+      UCID || '',
+      LIFECYCLE_STATUS.CONNECTED,
+      undefined,
+      UCID,
+      vapDualAccess,
+      profileType
+    );
+    reporting.reportGenerationRequested(GENERATION_PHASE.END_CALL, UCID || '');
+    streamAPICall();
+  };
+
+  const handleConnectedWithCallReporting = () => {
+    setTargetShowSmartNotesGlobalState({showSmartNotes: true});
+    // Initialize startTime for this tab when member loads so mid-call generate has a valid start reference.
+    if (!effectiveSmartNotesGlobalState?.startTime) {
+      setTargetSmartNotesGlobalStartTimeState({startTime: new Date().toISOString().slice(0, -1)});
+    }
+    reporting.setReportingKey(UCID && reportingMemberId ? `${UCID}-${reportingMemberId}` : undefined);
+    if (canTriggerEndCallFromCurrentTab) {
+      setTargetCallEvent(true);
+      return;
+    }
+    // Non-owner tab: do not arm end-call stream.
+    setTargetCallEvent(false);
+  };
+
+  useEffect(() => {
+    if (telephonyStatus !== TelephonyStatus.ConnectedWithCall || !displaySmartNotes(UCID, Boolean(vapAccess))) {
+      return;
+    }
+
+    const shouldCreateOnLoad = !useOwnerTabContext && canTriggerEndCallFromCurrentTab && isCurrentTabOwnerForCall;
+
+    if (!shouldCreateOnLoad || !reportingMemberId) {
+      return;
+    }
+
+    if (callOwnerKey && connectedReportCreatedCallKeys.has(callOwnerKey)) {
+      return;
+    }
+
+    reporting.setReportingKey(UCID && reportingMemberId ? `${UCID}-${reportingMemberId}` : undefined);
+    if (callOwnerKey) {
+      connectedReportCreatedCallKeys.add(callOwnerKey);
+    }
+    reporting.createAttempt(
+      GENERATION_PHASE.END_CALL,
+      UCID || '',
+      LIFECYCLE_STATUS.CONNECTED,
+      undefined,
+      UCID,
+      vapDualAccess,
+      profileType
+    );
+  }, [
+    telephonyStatus,
+    UCID,
+    vapAccess,
+    vapDualAccess,
+    profileType,
+    reportingMemberId,
+    callOwnerKey,
+    useOwnerTabContext,
+    canTriggerEndCallFromCurrentTab,
+    isCurrentTabOwnerForCall,
+    telephonyMemberId,
+    telephonyPatientId
+  ]);
+
+  const setNonOwnerVisibility = (hasSmartNotesDataOrErrorForCurrentTab: boolean) => {
+    const tabMidCallAttemptKey = `${activeTabIndex}:${UCID || ''}`;
+    const hasMidCallAttemptForCurrentTabAndCall = midCallAttemptedTabCallKeys.has(tabMidCallAttemptKey);
+    const shouldKeepVisibleDuringActiveCall =
+      telephonyStatus === TelephonyStatus.ConnectedWithCall && displaySmartNotes(UCID, Boolean(vapAccess));
+    const hasSavedNotesForCurrentTab = Boolean(previousSmartNotes);
+    const shouldKeepVisibleFromCurrentCallOutcome =
+      hasSmartNotesErrorForCurrentTab ||
+      (hasMidCallAttemptForCurrentTabAndCall && hasSmartNotesDataOrErrorForCurrentTab);
+    const nextShowSmartNotes =
+      shouldKeepVisibleDuringActiveCall ||
+      hasSavedNotesForCurrentTab ||
+      SmartNotesContextHelper.getNonOwnerSmartNotesVisibilityWhenEnabled(shouldKeepVisibleFromCurrentCallOutcome);
+    setTargetShowSmartNotesGlobalState({
+      showSmartNotes: nextShowSmartNotes
+    });
+  };
+
+  const clearOwnerStateAfterDisconnected = (previousStatus: TelephonyStatus | null) => {
+    // Clear persisted call owner info when a new inbound call starts, regardless of how the previous call ended.
+    // This covers both Disconnected → ConnectedWithCall and Connected/WWE → ConnectedWithCall transitions.
+    if (
+      telephonyStatus === TelephonyStatus.ConnectedWithCall &&
+      previousStatus !== TelephonyStatus.ConnectedWithCall &&
+      previousStatus !== null
+    ) {
+      callOwnerMemberIdRef.current = null;
+      callOwnerTabIndexRef.current = null;
+      activeCallOwnerState = null;
+    }
+  };
+
+  useEffect(() => {
+    const previousStatus = previousTelephonyStatus.current;
+    const endCallFlow = SmartNotesContextHelper.computeEndCallFlow({
+      useOwnerTabContext,
+      telephonyStatus,
+      previousStatus,
+      callOwnerKey,
+      activeCallOwnerState,
+      canTriggerEndCallFromOwnerContext,
+      pciFlag,
+      acUs9494658,
+      isPbm,
+      isPharmacy,
+      autoCallRecordEnabled: isLDFlagEnabled('acAutoCallRecordAiDoc'),
+      pharmacySmartNotesEnabled: isLDFlagEnabled('acPharmacySmartNotes'),
+      stopAutomaticNotes,
+      previousSmartNotes,
+      callOwnerMemberIdRefCurrent: callOwnerMemberIdRef.current,
+      isAgentAfterCallWorkInWwe,
+      isTelephonyStatusAfterCallWorkForAmazon,
+      acDe1362105b,
+      eventCallCheck,
+      rawTelephonyCallKey: callUuid || ucid
+    });
+    const {
+      isEnteringConnectedWithCall,
+      shouldInitializeOwnerForActiveCall,
+      isEndCallStatus,
+      shouldTriggerOwnerEndCallStream
+    } = endCallFlow;
+
+    // Clear stale owner state first, then lock new owner for the incoming call.
+    clearOwnerStateAfterDisconnected(previousStatus);
+
+    // Persist call owner info when call connects.
+    if (isEnteringConnectedWithCall || shouldInitializeOwnerForActiveCall) {
+      persistOwnerForActiveCall();
+    }
+
+    const hasSmartNotesDataOrErrorForCurrentTab = Boolean(previousSmartNotes) || hasSmartNotesErrorForCurrentTab;
+    const hasSmartNotesDataForCurrentTab = Boolean(previousSmartNotes);
+
+    if (shouldTriggerOwnerEndCallStream) {
+      // Telephony status is connected to wwe or in after call work.
+      handleOwnerEndCallFlow(hasSmartNotesDataForCurrentTab);
+    } else if (isEndCallStatus && !canTriggerEndCallFromCurrentTab) {
+      // Keep non-owner tabs on manual notes by default, but preserve generated/error Smart Notes for that tab.
+      setNonOwnerVisibility(hasSmartNotesDataOrErrorForCurrentTab);
+      setTargetCallEvent(false);
+    } else if (
+      !useOwnerTabContext &&
+      telephonyStatus === TelephonyStatus.ConnectedWithCall &&
+      displaySmartNotes(UCID, Boolean(vapAccess))
+    ) {
+      handleConnectedWithCallReporting();
+    } else if (telephonyStatus === TelephonyStatus.Disconnected && !canTriggerEndCallFromCurrentTab) {
+      // On disconnect, keep non-owner tabs on manual notes.
+      // Owner tab should keep Smart Notes visible so stream errors are shown.
+      setNonOwnerVisibility(hasSmartNotesDataOrErrorForCurrentTab);
+    }
+
+    previousTelephonyStatus.current = telephonyStatus;
+  }, [
+    telephonyStatus,
+    isAgentAfterCallWorkInWwe,
+    isTelephonyStatusAfterCallWorkForAmazon,
+    acDe1362105b,
+    canTriggerEndCallFromCurrentTab,
+    canTriggerEndCallFromOwnerContext,
+    eventCallCheck,
+    UCID,
+    vapAccess,
+    vapDualAccess,
+    memberId,
+    profileType,
+    callOwnerKey,
+    pciFlag,
+    acUs9494658,
+    isPbm,
+    isPharmacy,
+    previousSmartNotes,
+    effectiveSmartNotesGlobalState?.stopAutomaticNotes,
+    firstMemberOrPatientTabMemberId,
+    firstMemberOrPatientTabIndex,
+    useOwnerTabContext,
+    reportingMemberId
+  ]);
+
+  useEffect(() => {
+    if (SmartNotesContextHelper.shouldRunOwnerContextOnlyFlow(useOwnerTabContext)) {
+      return;
+    }
+    if (smartNotesGlobalState?.generateSmartNotes && displaySmartNotes(UCID, Boolean(vapAccess))) {
+      const effectiveStartTimeForGeneration = shouldRouteOwnerContextState
+        ? effectiveSmartNotesGlobalState?.startTime
+        : smartNotesGlobalState?.startTime;
+      setIsLoading(true);
+      setGenerateGlobalSmartNotes({generateSmartNotes: false});
+      if (midCallGenerationCount.current > 0) {
+        reporting.resetAttemptState();
+
+        if (previousCallInteractionId.current) {
+          processedMidCallIds.delete(previousCallInteractionId.current);
+          previousCallInteractionId.current = null;
+        }
+      }
+      midCallGenerationCount.current += 1;
+      if (UCID) {
+        midCallAttemptedTabCallKeys.add(`${activeTabIndex}:${UCID}`);
+      }
+      // Report creation is tied to explicit Generate click so success and failure paths share one attempt.
+      reporting.createAttempt(
+        GENERATION_PHASE.MID_CALL,
+        UCID || '',
+        LIFECYCLE_STATUS.REQUESTED,
+        Date.now().toString(),
+        UCID,
+        vapDualAccess,
+        profileType
+      );
+      streamPhaseRef.current = 'mid-call';
+      if (vapDualSmartNoteState?.startTime && acSmartNoteDualAccess && vapDualAccess) {
+        generateSmartNotesMidCallDetails({
+          ucid: UCID,
+          startTime: vapDualSmartNoteState.startTime,
+          profileType,
+          vapDualAccess
+        });
+      } else if (effectiveStartTimeForGeneration) {
+        generateSmartNotesMidCallDetails({
+          ucid: UCID,
+          startTime: effectiveStartTimeForGeneration,
+          profileType
+        });
+      } else {
+        generateSmartNotesMidCallDetails({ucid: UCID, profileType});
+      }
+    } else if (smartNotesGlobalState?.generateSmartNotes && !displaySmartNotes(UCID, Boolean(vapAccess))) {
+      setTargetShowSmartNotesGlobalState({showSmartNotes: false});
+    }
+  }, [smartNotesGlobalState?.generateSmartNotes, useOwnerTabContext]);
+
+  useEffect(() => {
+    if (SmartNotesContextHelper.shouldRunOwnerContextOnlyFlow(useOwnerTabContext)) {
+      return;
+    }
+    if (streamPhaseRef.current !== 'mid-call' || telephonyStatus !== TelephonyStatus.ConnectedWithCall) {
+      return;
+    }
+    if (midCallSmartNotes?.searchOutputMetaData?.respCode === 200 && UCID) {
+      const currentCallInteractionId = midCallSmartNotes.callInteractionId || UCID;
+      if (processedMidCallIds.has(currentCallInteractionId)) {
+        return;
+      }
+      processedMidCallIds.add(currentCallInteractionId);
+      previousCallInteractionId.current = currentCallInteractionId;
+      streamAPICall();
+    } else if (midCallSmartNotes?.searchOutputMetaData?.respCode === 400) {
+      setIsLoading(false);
+      setTargetShowSmartNotesGlobalState({showSmartNotes: true});
+      setTargetSmartNotesGlobalErrorState({
+        isError: true,
+        error: midCallSmartNotes?.searchOutputMetaData?.respMessage,
+        errorID: UCID
+      });
+      reporting.reportMidCallFailure(midCallSmartNotes?.searchOutputMetaData?.respMessage);
+    }
+  }, [midCallSmartNotes, useOwnerTabContext, telephonyStatus, UCID]);
+
+  useEffect(() => {
+    if (SmartNotesContextHelper.shouldRunOwnerContextOnlyFlow(useOwnerTabContext)) {
+      return;
+    }
+    if (streamPhaseRef.current !== 'mid-call' || telephonyStatus !== TelephonyStatus.ConnectedWithCall) {
+      return;
+    }
+    if (midCallSmartNotesIsError && midCallSmartNotesError) {
+      setIsLoading(false);
+      setTargetShowSmartNotesGlobalState({showSmartNotes: true});
+      setTargetSmartNotesGlobalErrorState({isError: true, errorID: UCID});
+      const errorData = midCallSmartNotesError?.response?.data || midCallSmartNotesError?.data;
+      const errorMessage =
+        errorData?.searchOutputMetaData?.respMessage || midCallSmartNotesError?.message || 'API request failed.';
+      reporting.reportMidCallFailure(errorMessage);
+    }
+  }, [
+    midCallSmartNotesIsError,
+    midCallSmartNotesError,
+    useOwnerTabContext,
+    telephonyStatus,
+    UCID,
+    reportingMemberId,
+    callOwnerKey
+  ]);
+
+  return {isLoading: effectiveIsLoading, updateReportingOnWrapUp: reporting.reportWrapUpComplete};
+}
